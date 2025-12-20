@@ -1,0 +1,920 @@
+# BreastMNIST: KAN vs ANN Full Study
+# - Multi-seed, multi-K sweep
+# - Matched parameter budgets
+# - Early stopping on val AUC
+# - Full metrics, calibration summary (Brier), and speed benchmarks
+
+import sys
+import subprocess
+import warnings
+warnings.filterwarnings("ignore")
+
+# Optional: ensure dependencies in Colab-like environments
+def _pip(pkg):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=False)
+
+try:
+    import medmnist
+except Exception:
+    _pip("medmnist==2.2.2")
+try:
+    import torchvision
+except Exception:
+    _pip("torchvision")
+
+import os
+import time
+import random
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from medmnist import BreastMNIST
+
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, average_precision_score,
+    f1_score, precision_score, recall_score, confusion_matrix,
+    roc_curve, precision_recall_curve, brier_score_loss
+)
+from sklearn.calibration import calibration_curve
+
+
+# ==========================
+# 0) Global Config
+# ==========================
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", DEVICE)
+
+ROOT = "medmnist_data"
+os.makedirs(ROOT, exist_ok=True)
+
+IMG_SIZE = 64
+BATCH_SIZE = 128
+
+# KAN capacity values
+K_VALUES = [3, 5, 7, 9]
+# Random seeds for robustness
+SEEDS = [42, 43, 44]
+
+EPOCHS = 50
+PATIENCE = 8
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+USE_POS_WEIGHT = True
+
+THRESHOLD = 0.5  # fixed operating point for confusion-based metrics
+
+# Forward-only speed benchmark config
+BENCH_BATCH = 128
+BENCH_WARMUP = 30
+BENCH_ITERS = 120
+
+
+# ==========================
+# 1) Repro utilities
+# ==========================
+
+def set_seed(seed: int = 42) -> None:
+    """Set random seeds for Python, NumPy and PyTorch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+
+
+def count_params(m: nn.Module) -> int:
+    """Return the number of trainable parameters in a model."""
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+
+# ==========================
+# 2) Data: BreastMNIST loaders
+# ==========================
+
+train_tf = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+test_tf = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+train_ds_raw = BreastMNIST(split="train", download=True, transform=train_tf, root=ROOT)
+val_ds_raw   = BreastMNIST(split="val",   download=True, transform=test_tf, root=ROOT)
+test_ds_raw  = BreastMNIST(split="test",  download=True, transform=test_tf, root=ROOT)
+
+
+class BreastWrapper(torch.utils.data.Dataset):
+    """Ensure labels are scalar float tensors suitable for BCEWithLogitsLoss."""
+    def __init__(self, base_ds):
+        self.base = base_ds
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        img, lab = self.base[idx]
+        if isinstance(lab, (np.ndarray, torch.Tensor)):
+            lab = lab.item()
+        return img, torch.tensor(float(lab), dtype=torch.float32)
+
+
+train_loader = DataLoader(
+    BreastWrapper(train_ds_raw),
+    batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True
+)
+val_loader = DataLoader(
+    BreastWrapper(val_ds_raw),
+    batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True
+)
+test_loader = DataLoader(
+    BreastWrapper(test_ds_raw),
+    batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True
+)
+
+print(f"BreastMNIST sizes: Train {len(train_ds_raw)}, Val {len(val_ds_raw)}, Test {len(test_ds_raw)}")
+
+
+@torch.no_grad()
+def estimate_pos_weight(loader) -> float:
+    """Estimate positive class weight (#neg / #pos) for BCEWithLogitsLoss."""
+    pos = 0
+    neg = 0
+    for _, y in loader:
+        y_np = y.view(-1).numpy()
+        pos += (y_np == 1).sum()
+        neg += (y_np == 0).sum()
+    pos = max(1, pos)
+    return float(neg) / float(pos)
+
+
+# ==========================
+# 3) Model components: LFP + KAN/ANN GFP + classifier
+# ==========================
+
+class LFFN(nn.Module):
+    """Local FFN with depthwise + pointwise convolutions."""
+    def __init__(self, ch: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(ch, ch, 1, bias=False),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 1, bias=False),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LFPBlock(nn.Module):
+    """Local Feature Perception block."""
+    def __init__(self, ch: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(ch)
+        self.ln2 = nn.LayerNorm(ch)
+        self.lffn = LFFN(ch)
+        self.dw = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        u = self.ln1(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = x + self.dw(u)
+        v = self.ln2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = x + self.lffn(v)
+        return x
+
+
+class RobustSpline1D(nn.Module):
+    """
+    Fixed triangular spline basis with tanh normalization.
+    Maps [B, D] -> [B, D*K].
+    """
+    def __init__(self, in_dim: int, K: int = 5):
+        super().__init__()
+        self.K = K
+        self.register_buffer("centers", torch.linspace(-1.0, 1.0, K).view(1, 1, K))
+        self.h = 2.0 / (K - 1 + 1e-8)
+
+    def forward(self, x):
+        # x: [B, D]
+        x_norm = torch.tanh(x).unsqueeze(-1)      # [B, D, 1]
+        phi = F.relu(1.0 - torch.abs((x_norm - self.centers) / self.h))
+        return phi.flatten(1)                     # [B, D*K]
+
+
+class KANLinear(nn.Module):
+    """Linear layer on top of 1D spline basis expansion."""
+    def __init__(self, in_dim: int, out_dim: int, K: int = 5):
+        super().__init__()
+        self.spline = RobustSpline1D(in_dim, K)
+        self.linear = nn.Linear(in_dim * K, out_dim)
+
+    def forward(self, x):
+        return self.linear(self.spline(x))
+
+
+class GFPBlock_KAN(nn.Module):
+    """Global Feature Perception block with KAN feed-forward."""
+    def __init__(self, ch: int, K: int = 5):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(ch)
+        self.ln2 = nn.LayerNorm(ch)
+        self.attn = nn.MultiheadAttention(ch, num_heads=4, batch_first=True)
+        self.kan = KANLinear(ch, ch, K=K)
+        self.drop = nn.Dropout(0.1)
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        B, C, H, W = x.shape
+        tokens = x.permute(0, 2, 3, 1).reshape(B, -1, C)
+
+        a = self.ln1(tokens)
+        att, _ = self.attn(a, a, a)
+        tokens = tokens + self.drop(att)
+
+        b = self.ln2(tokens)
+        kan_out = self.kan(b.reshape(-1, C)).reshape(B, H * W, C)
+        tokens = tokens + self.drop(kan_out)
+
+        return tokens.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+
+class GFPBlock_ANN(nn.Module):
+    """Global Feature Perception block with standard MLP feed-forward."""
+    def __init__(self, ch: int, hidden_dim: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(ch)
+        self.ln2 = nn.LayerNorm(ch)
+        self.attn = nn.MultiheadAttention(ch, num_heads=4, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(ch, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, ch),
+        )
+        self.drop = nn.Dropout(0.1)
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        B, C, H, W = x.shape
+        tokens = x.permute(0, 2, 3, 1).reshape(B, -1, C)
+
+        a = self.ln1(tokens)
+        att, _ = self.attn(a, a, a)
+        tokens = tokens + self.drop(att)
+
+        b = self.ln2(tokens)
+        mlp_out = self.mlp(b)
+        tokens = tokens + self.drop(mlp_out)
+
+        return tokens.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+
+class MedViT_Base(nn.Module):
+    """
+    Shared MedViT-style backbone with switchable GFP mode:
+    - mode="KAN": KANLinear FFN with K spline centers.
+    - mode="ANN": MLP FFN with hidden dimension ann_hidden.
+    """
+    def __init__(self, mode: str = "KAN", K: int = 5, ann_hidden: int = 128):
+        super().__init__()
+        assert mode in ("KAN", "ANN")
+        self.mode = mode
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )
+
+        self.lfp = LFPBlock(64)
+        self.down = nn.Conv2d(64, 128, 3, stride=2, padding=1)
+
+        if mode == "KAN":
+            self.gfp = GFPBlock_KAN(128, K=K)
+        else:
+            self.gfp = GFPBlock_ANN(128, hidden_dim=ann_hidden)
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.lfp(x)
+        x = self.down(x)
+        x = self.gfp(x)
+        x = self.pool(x).flatten(1)
+        return self.head(x).squeeze(1)
+
+
+# ==========================
+# 4) Train / Eval / Benchmark
+# ==========================
+
+def train_epoch(model, loader, opt, crit):
+    """One training epoch: returns (loss, accuracy)."""
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+    for x, y in loader:
+        x = x.to(DEVICE, non_blocking=True)
+        y = y.to(DEVICE, non_blocking=True)
+
+        opt.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = crit(logits, y)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+
+        total_loss += loss.item() * y.size(0)
+        with torch.no_grad():
+            p = torch.sigmoid(logits)
+            pred = (p >= THRESHOLD).float()
+            correct += (pred == y).sum().item()
+        total += y.size(0)
+
+    return total_loss / max(1, total), correct / max(1, total)
+
+
+@torch.no_grad()
+def eval_probs(model, loader, crit):
+    """
+    Evaluate model on loader and return:
+    (loss, accuracy, AUC, AP, probs, labels).
+    """
+    model.eval()
+    total_loss, n = 0.0, 0
+    probs, labels = [], []
+    correct = 0
+
+    for x, y in loader:
+        x = x.to(DEVICE, non_blocking=True)
+        y = y.to(DEVICE, non_blocking=True)
+        logits = model(x)
+        loss = crit(logits, y)
+
+        total_loss += loss.item() * y.size(0)
+        n += y.size(0)
+
+        p = torch.sigmoid(logits)
+        probs.append(p.detach().cpu().numpy())
+        labels.append(y.detach().cpu().numpy())
+
+        pred = (p >= THRESHOLD).float()
+        correct += (pred == y).sum().item()
+
+    probs = np.concatenate(probs)
+    labels = np.concatenate(labels)
+
+    # AUC / AP only defined if both classes present
+    if len(np.unique(labels)) == 2:
+        auc = roc_auc_score(labels, probs)
+        ap = average_precision_score(labels, probs)
+    else:
+        auc = np.nan
+        ap = np.nan
+
+    acc = correct / max(1, n)
+    return total_loss / max(1, n), acc, auc, ap, probs, labels
+
+
+def run_experiment(model, epochs=EPOCHS, patience=PATIENCE):
+    """
+    Train a single model with early stopping on validation AUC.
+    Returns:
+      best_model, history_dict, best_val_auc, best_epoch
+    """
+    model = model.to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    if USE_POS_WEIGHT:
+        pw = estimate_pos_weight(train_loader)
+        crit = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=DEVICE))
+    else:
+        crit = nn.BCEWithLogitsLoss()
+
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    best_auc = -1.0
+    best_state = None
+    best_epoch = -1
+    bad = 0
+
+    history = {
+        "tr_loss": [],
+        "tr_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+        "val_auc": [],
+        "val_ap": [],
+    }
+
+    for ep in range(1, epochs + 1):
+        tr_loss, tr_acc = train_epoch(model, train_loader, opt, crit)
+        val_loss, val_acc, val_auc, val_ap, _, _ = eval_probs(model, val_loader, crit)
+        sched.step()
+
+        history["tr_loss"].append(tr_loss)
+        history["tr_acc"].append(tr_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["val_auc"].append(val_auc)
+        history["val_ap"].append(val_ap)
+
+        if val_auc > best_auc + 1e-4:
+            best_auc = float(val_auc)
+            best_epoch = ep
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, history, best_auc, best_epoch
+
+
+@torch.no_grad()
+def benchmark_forward_only(model,
+                           input_shape=(BENCH_BATCH, 1, IMG_SIZE, IMG_SIZE),
+                           iters=BENCH_ITERS,
+                           warmup=BENCH_WARMUP):
+    """
+    Forward-only benchmark: returns (ms_per_img, imgs_per_sec).
+    """
+    model.eval()
+    x = torch.randn(*input_shape, device=DEVICE)
+
+    if DEVICE.type == "cuda":
+        starter = torch.cuda.Event(enable_timing=True)
+        ender = torch.cuda.Event(enable_timing=True)
+
+        for _ in range(warmup):
+            _ = model(x)
+        torch.cuda.synchronize()
+
+        times = []
+        for _ in range(iters):
+            starter.record()
+            _ = model(x)
+            ender.record()
+            torch.cuda.synchronize()
+            times.append(starter.elapsed_time(ender))  # ms per batch
+        ms_per_batch = float(np.mean(times))
+    else:
+        for _ in range(warmup):
+            _ = model(x)
+        t0 = time.time()
+        for _ in range(iters):
+            _ = model(x)
+        t1 = time.time()
+        ms_per_batch = (t1 - t0) / iters * 1e3
+
+    ms_per_img = ms_per_batch / input_shape[0]
+    imgs_per_sec = 1000.0 / ms_per_img
+    return ms_per_img, imgs_per_sec
+
+
+def metrics_from_probs(y, p, thr=THRESHOLD):
+    """
+    Compute standard binary classification metrics and Brier score
+    from true labels and predicted probabilities.
+    """
+    y = np.asarray(y).astype(int)
+    p = np.asarray(p)
+    pred = (p >= thr).astype(int)
+
+    cm = confusion_matrix(y, pred)
+    if cm.shape != (2, 2):
+        return {"cm": cm}
+
+    tn, fp, fn, tp = cm.ravel()
+    spec = tn / (tn + fp + 1e-8)
+    sens = tp / (tp + fn + 1e-8)
+
+    return {
+        "acc": accuracy_score(y, pred),
+        "auc": roc_auc_score(y, p) if len(np.unique(y)) == 2 else np.nan,
+        "ap": average_precision_score(y, p) if len(np.unique(y)) == 2 else np.nan,
+        "f1": f1_score(y, pred, zero_division=0),
+        "precision": precision_score(y, pred, zero_division=0),
+        "recall": recall_score(y, pred, zero_division=0),
+        "sensitivity": sens,
+        "specificity": spec,
+        "brier": brier_score_loss(y, p),
+        "cm": cm,
+    }
+
+
+# ==========================
+# 5) Plot helpers
+# ==========================
+
+def plot_curve_compare(x1, y1, x2, y2, title, xlab, ylab, label1="KAN", label2="ANN"):
+    plt.figure(figsize=(7, 4))
+    plt.plot(x1, y1, label=label1)
+    plt.plot(x2, y2, label=label2)
+    plt.title(title)
+    plt.xlabel(xlab)
+    plt.ylabel(ylab)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_multi_curves(xs, ys_list, labels, title, xlab, ylab):
+    plt.figure(figsize=(7, 4))
+    for x, y, lab in zip(xs, ys_list, labels):
+        plt.plot(x, y, label=lab)
+    plt.title(title)
+    plt.xlabel(xlab)
+    plt.ylabel(ylab)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_confusion(cm, title):
+    plt.figure(figsize=(4.5, 4))
+    plt.imshow(cm, interpolation="nearest")
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    for (i, j), v in np.ndenumerate(cm):
+        plt.text(j, i, str(v), ha="center", va="center")
+    plt.xticks([0, 1])
+    plt.yticks([0, 1])
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_trend_vs_params(df, metric, title, ylab):
+    plt.figure(figsize=(6, 4))
+    plt.scatter(df["kan_params"], df[f"kan_{metric}"], label="KAN")
+    plt.scatter(df["ann_params"], df[f"ann_{metric}"], label="ANN")
+    plt.xlabel("Trainable parameters")
+    plt.ylabel(ylab)
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_trend_vs_K(df, metric, title, ylab):
+    m_kan = df.groupby("K")[f"kan_{metric}"].mean()
+    m_ann = df.groupby("K")[f"ann_{metric}"].mean()
+    plt.figure(figsize=(6, 4))
+    plt.plot(m_kan.index.values, m_kan.values, "o-", label="KAN")
+    plt.plot(m_ann.index.values, m_ann.values, "x--", label="ANN")
+    plt.xlabel("K")
+    plt.ylabel(ylab)
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def collect_hist_for(histories, model_key, hist_key, seeds, K_values):
+    xs, ys, labels = [], [], []
+    for seed in seeds:
+        for K in K_values:
+            h = histories[(seed, K)][model_key]
+            x = np.arange(1, len(h[hist_key]) + 1)
+            y = np.array(h[hist_key], dtype=float)
+            xs.append(x)
+            ys.append(y)
+            labels.append(f"{model_key} K={K} seed={seed}")
+    return xs, ys, labels
+
+
+# ==========================
+# 6) ANN hidden-dim matching and main sweep
+# ==========================
+
+def find_matching_ann_hidden(target_params, start=64, step=16, max_hidden=1024):
+    """
+    Given a target parameter count from a KAN model, find the smallest ANN hidden dim
+    such that ANN params >= target_params.
+    """
+    h = start
+    while h <= max_hidden:
+        m = MedViT_Base(mode="ANN", ann_hidden=h)
+        if count_params(m) >= target_params:
+            return h
+        h += step
+    return max_hidden
+
+
+def run_sweep():
+    all_rows = []
+    histories = {}
+    best = {
+        "KAN": {"test_auc": -1, "model": None, "K": None, "ann_hidden": None},
+        "ANN": {"test_auc": -1, "model": None, "K": None, "ann_hidden": None},
+    }
+
+    for seed in SEEDS:
+        set_seed(seed)
+        print(f"\n===== SEED {seed} =====")
+
+        for K in K_VALUES:
+            # --- KAN model ---
+            kan = MedViT_Base(mode="KAN", K=K)
+            kan_params = count_params(kan)
+            print(f"\n[KAN] K={K} | params={kan_params}")
+
+            kan, hist_kan, best_val_auc_kan, best_ep_kan = run_experiment(kan)
+
+            # --- ANN model (param-matched) ---
+            ann_h = find_matching_ann_hidden(kan_params)
+            ann = MedViT_Base(mode="ANN", ann_hidden=ann_h)
+            ann_params = count_params(ann)
+            print(f"[ANN] hidden={ann_h} | params={ann_params} (matched to KAN K={K})")
+
+            ann, hist_ann, best_val_auc_ann, best_ep_ann = run_experiment(ann)
+
+            histories[(seed, K)] = {"KAN": hist_kan, "ANN": hist_ann}
+
+            # --- Optional per-(seed,K) training curve comparisons ---
+            eK = np.arange(1, len(hist_kan["tr_loss"]) + 1)
+            eA = np.arange(1, len(hist_ann["tr_loss"]) + 1)
+
+            plot_curve_compare(
+                eK, hist_kan["tr_loss"], eA, hist_ann["tr_loss"],
+                title=f"Train Loss: KAN vs ANN (K={K}, seed={seed})",
+                xlab="Epoch", ylab="Loss",
+            )
+            plot_curve_compare(
+                eK, hist_kan["val_loss"], eA, hist_ann["val_loss"],
+                title=f"Val Loss: KAN vs ANN (K={K}, seed={seed})",
+                xlab="Epoch", ylab="Loss",
+            )
+            plot_curve_compare(
+                eK, hist_kan["tr_acc"], eA, hist_ann["tr_acc"],
+                title=f"Train Accuracy: KAN vs ANN (K={K}, seed={seed})",
+                xlab="Epoch", ylab="Accuracy",
+            )
+            plot_curve_compare(
+                eK, hist_kan["val_acc"], eA, hist_ann["val_acc"],
+                title=f"Val Accuracy: KAN vs ANN (K={K}, seed={seed})",
+                xlab="Epoch", ylab="Accuracy",
+            )
+
+            print(
+                f"Best VAL AUC: KAN={best_val_auc_kan:.4f} (epoch {best_ep_kan}) | "
+                f"ANN={best_val_auc_ann:.4f} (epoch {best_ep_ann})"
+            )
+
+            # --- Test evaluation at threshold=0.5 ---
+            crit_eval = nn.BCEWithLogitsLoss()
+            _, _, _, _, p_kan, y_kan = eval_probs(kan, test_loader, crit_eval)
+            _, _, _, _, p_ann, y_ann = eval_probs(ann, test_loader, crit_eval)
+
+            m_kan = metrics_from_probs(y_kan, p_kan, thr=THRESHOLD)
+            m_ann = metrics_from_probs(y_ann, p_ann, thr=THRESHOLD)
+
+            # --- Inference benchmark (forward-only) ---
+            kan_ms, kan_ips = benchmark_forward_only(kan)
+            ann_ms, ann_ips = benchmark_forward_only(ann)
+
+            # --- Per-(seed,K) summary row ---
+            row = {
+                "seed": seed,
+                "K": K,
+                "kan_params": kan_params,
+                "ann_hidden": ann_h,
+                "ann_params": ann_params,
+                "kan_best_val_auc": best_val_auc_kan,
+                "ann_best_val_auc": best_val_auc_ann,
+                "kan_auc": m_kan["auc"],
+                "ann_auc": m_ann["auc"],
+                "kan_ap": m_kan["ap"],
+                "ann_ap": m_ann["ap"],
+                "kan_acc": m_kan["acc"],
+                "ann_acc": m_ann["acc"],
+                "kan_f1": m_kan["f1"],
+                "ann_f1": m_ann["f1"],
+                "kan_precision": m_kan["precision"],
+                "ann_precision": m_ann["precision"],
+                "kan_recall": m_kan["recall"],
+                "ann_recall": m_ann["recall"],
+                "kan_sensitivity": m_kan["sensitivity"],
+                "ann_sensitivity": m_ann["sensitivity"],
+                "kan_specificity": m_kan["specificity"],
+                "ann_specificity": m_ann["specificity"],
+                "kan_brier": m_kan["brier"],
+                "ann_brier": m_ann["brier"],
+                "kan_ms_per_img": kan_ms,
+                "ann_ms_per_img": ann_ms,
+                "kan_imgs_per_sec": kan_ips,
+                "ann_imgs_per_sec": ann_ips,
+            }
+            all_rows.append(row)
+
+            # Track best by test AUC for deep-dive plots
+            if m_kan["auc"] > best["KAN"]["test_auc"]:
+                best["KAN"].update({
+                    "test_auc": m_kan["auc"],
+                    "model": kan,
+                    "K": K,
+                    "ann_hidden": ann_h,
+                })
+            if m_ann["auc"] > best["ANN"]["test_auc"]:
+                best["ANN"].update({
+                    "test_auc": m_ann["auc"],
+                    "model": ann,
+                    "K": K,
+                    "ann_hidden": ann_h,
+                })
+
+    df = pd.DataFrame(all_rows)
+    return df, histories, best
+
+
+# ==========================
+# 7) Main entry: run sweep + analysis
+# ==========================
+
+def main():
+    df, histories, best = run_sweep()
+
+    # Full table of all runs
+    print("\n================== ALL RUNS (per seed, per K) ==================")
+    print(df.to_string(index=False))
+
+    # Mean and std by K
+    mean_df = df.groupby("K").mean(numeric_only=True).reset_index()
+    std_df = df.groupby("K").std(numeric_only=True).reset_index()
+
+    print("\n================== MEAN by K ==================")
+    print(mean_df.to_string(index=False))
+
+    if len(SEEDS) > 1:
+        print("\n================== STD by K ==================")
+        print(std_df.to_string(index=False))
+
+    # Trend plots vs K and params
+    metrics_trended = [
+        ("best_val_auc", "Best VAL AUC (early-stopped)", "AUC"),
+        ("auc", "Test AUC (thr=0.5)", "AUC"),
+        ("ap", "Test Average Precision", "AP"),
+        ("acc", "Test Accuracy (thr=0.5)", "Accuracy"),
+        ("f1", "Test F1 (thr=0.5)", "F1"),
+        ("precision", "Test Precision (thr=0.5)", "Precision"),
+        ("recall", "Test Recall (thr=0.5)", "Recall"),
+        ("sensitivity", "Test Sensitivity (thr=0.5)", "Sensitivity"),
+        ("specificity", "Test Specificity (thr=0.5)", "Specificity"),
+        ("brier", "Test Brier (lower is better)", "Brier"),
+        ("ms_per_img", "Inference time (ms/img)", "ms/img"),
+        ("imgs_per_sec", "Throughput (imgs/sec)", "imgs/sec"),
+    ]
+
+    for metric, title, ylab in metrics_trended:
+        plot_trend_vs_K(df, metric, f"{title} vs K", ylab)
+        plot_trend_vs_params(df, metric, f"{title} vs Params", ylab)
+
+    # Training curves for all K for KAN and ANN
+    for hist_key, title, ylab in [
+        ("tr_loss", "TRAIN LOSS curves (all K)", "Loss"),
+        ("val_loss", "VAL LOSS curves (all K)", "Loss"),
+        ("tr_acc", "TRAIN ACCURACY curves (all K)", "Accuracy"),
+        ("val_acc", "VAL ACCURACY curves (all K)", "Accuracy"),
+    ]:
+        xs, ys, labels = collect_hist_for(histories, "KAN", hist_key, SEEDS, K_VALUES)
+        plot_multi_curves(xs, ys, labels, title=f"KAN: {title}", xlab="Epoch", ylab=ylab)
+
+        xs, ys, labels = collect_hist_for(histories, "ANN", hist_key, SEEDS, K_VALUES)
+        plot_multi_curves(xs, ys, labels, title=f"ANN: {title}", xlab="Epoch", ylab=ylab)
+
+    # Best-model deep dive (by test AUC)
+    best_kan = best["KAN"]["model"]
+    best_ann = best["ANN"]["model"]
+
+    crit_eval = nn.BCEWithLogitsLoss()
+    _, _, _, _, pK, yK = eval_probs(best_kan, test_loader, crit_eval)
+    _, _, _, _, pA, yA = eval_probs(best_ann, test_loader, crit_eval)
+
+    mK = metrics_from_probs(yK, pK, thr=THRESHOLD)
+    mA = metrics_from_probs(yA, pA, thr=THRESHOLD)
+
+    # ROC
+    fprK, tprK, _ = roc_curve(yK, pK)
+    fprA, tprA, _ = roc_curve(yA, pA)
+    plt.figure(figsize=(6, 4))
+    plt.plot(fprK, tprK, label=f"KAN (K={best['KAN']['K']}) AUC={roc_auc_score(yK, pK):.3f}")
+    plt.plot(fprA, tprA, label=f"ANN (H={best['ANN']['ann_hidden']}) AUC={roc_auc_score(yA, pA):.3f}")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC (Best TEST-AUC models)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Precision–Recall
+    precK, recK, _ = precision_recall_curve(yK, pK)
+    precA, recA, _ = precision_recall_curve(yA, pA)
+    plt.figure(figsize=(6, 4))
+    plt.plot(recK, precK, label=f"KAN AP={average_precision_score(yK, pK):.3f}")
+    plt.plot(recA, precA, label=f"ANN AP={average_precision_score(yA, pA):.3f}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("PR (Best TEST-AUC models)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Calibration (reliability curves)
+    ptK, ppK = calibration_curve(yK, pK, n_bins=10, strategy="uniform")
+    ptA, ppA = calibration_curve(yA, pA, n_bins=10, strategy="uniform")
+    plt.figure(figsize=(6, 4))
+    plt.plot(ppK, ptK, "o-", label="KAN")
+    plt.plot(ppA, ptA, "x--", label="ANN")
+    plt.plot([0, 1], [0, 1], "k:", label="Perfect")
+    plt.xlabel("Mean predicted probability")
+    plt.ylabel("Fraction of positives")
+    plt.title("Calibration (Best TEST-AUC models)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Confusion matrices
+    plot_confusion(mK["cm"], f"KAN Confusion (best TEST AUC) thr={THRESHOLD}")
+    plot_confusion(mA["cm"], f"ANN Confusion (best TEST AUC) thr={THRESHOLD}")
+
+    # Speed bars for the best models
+    kan_ms, kan_ips = benchmark_forward_only(best_kan)
+    ann_ms, ann_ips = benchmark_forward_only(best_ann)
+    plt.figure(figsize=(6, 4))
+    plt.bar(["KAN", "ANN"], [kan_ms, ann_ms])
+    plt.title("Inference time (ms/img) — forward only (best models)")
+    plt.ylabel("ms/img")
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(6, 4))
+    plt.bar(["KAN", "ANN"], [kan_ips, ann_ips])
+    plt.title("Throughput (imgs/sec) — forward only (best models)")
+    plt.ylabel("imgs/sec")
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+    plt.show()
+
+    # Final printed summary
+    print("\n================== BEST MODEL SUMMARY (TEST, thr=0.5) ==================")
+    print(
+        f"KAN best: K={best['KAN']['K']} | "
+        f"TestAUC={mK['auc']:.4f} AP={mK['ap']:.4f} "
+        f"Acc={mK['acc']:.4f} F1={mK['f1']:.4f} "
+        f"Prec={mK['precision']:.4f} Recall={mK['recall']:.4f} "
+        f"Sens={mK['sensitivity']:.4f} Spec={mK['specificity']:.4f} "
+        f"Brier={mK['brier']:.4f} | {kan_ms:.4f} ms/img | {kan_ips:.1f} imgs/s"
+    )
+    print(
+        f"ANN best: H={best['ANN']['ann_hidden']} | "
+        f"TestAUC={mA['auc']:.4f} AP={mA['ap']:.4f} "
+        f"Acc={mA['acc']:.4f} F1={mA['f1']:.4f} "
+        f"Prec={mA['precision']:.4f} Recall={mA['recall']:.4f} "
+        f"Sens={mA['sensitivity']:.4f} Spec={mA['specificity']:.4f} "
+        f"Brier={mA['brier']:.4f} | {ann_ms:.4f} ms/img | {ann_ips:.1f} imgs/s"
+    )
+
+
+if __name__ == "__main__":
+    main()
