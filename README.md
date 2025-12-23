@@ -1,5 +1,7 @@
 # BreastMNIST: Kolmogorov–Arnold Networks (KAN) vs ANN Head Comparison
 
+# website: Website code for the AI Breast Cancer detection -deployed on GCP VM -login: http://136.118.169.96:8080 
+
 ## 1. Project Overview
 
 This project investigates whether **Kolmogorov–Arnold Networks (KANs)** can match or outperform standard **Artificial Neural Network (ANN)** heads on the **BreastMNIST** dataset, **under the same or lower parameter budgets**.
