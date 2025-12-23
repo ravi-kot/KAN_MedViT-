@@ -454,33 +454,8 @@ val_dataset = BreastMNIST(split='val', download=True)
 test_dataset = BreastMNIST(split='test', download=True)
 ```
 
-### Run Experiments
 
-```bash
-# Sweep over K ∈ {3,5,7,9} and seeds ∈ {42,43,44}
-python train_breastmnist.py \
-  --k_values 3 5 7 9 \
-  --seeds 42 43 44 \
-  --max_epochs 50 \
-  --batch_size 32 \
-  --learning_rate 1e-3 \
-  --output_dir ./results/breastmnist/
-
-# This will produce:
-# - results/breastmnist/per_run_results.csv (all 24 model results)
-# - results/breastmnist/mean_std_by_k.csv (aggregated by K)
-# - results/breastmnist/figures/ (plots and curves)
-```
-
-### Generate Plots
-
-```bash
-python analyze_breastmnist.py \
-  --results_dir ./results/breastmnist/ \
-  --output_dir ./results/breastmnist/figures/
-```
-
-This generates:
+### Generated Plots
 - Training/validation curves for each model
 - Metric trends vs K
 - Metric trends vs parameter count
@@ -488,38 +463,10 @@ This generates:
 - Confusion matrices
 - Speed comparisons
 
----
-
 ## 11. File Structure
 
-```
-breastmnist_experiment/
-├── data/                          # BreastMNIST dataset (auto-downloaded)
-├── models/
-│   ├── medvit.py                 # MedViT backbone
-│   ├── kan_head.py               # RobustSpline1D + KANLinear
-│   ├── ann_head.py               # MLP head
-│   └── combined.py               # Full model (backbone + head)
-├── train_breastmnist.py          # Main training script
-├── analyze_breastmnist.py        # Results analysis and plotting
-├── results/
-│   ├── breastmnist/
-│   │   ├── per_run_results.csv   # All model results
-│   │   ├── mean_std_by_k.csv     # Aggregated by K
-│   │   └── figures/
-│   │       ├── training_curves_k3_seed42.png
-│   │       ├── metric_trends_vs_k.png
-│   │       ├── metric_trends_vs_params.png
-│   │       ├── best_model_roc_curves.png
-│   │       ├── best_model_calibration.png
-│   │       └── ...
-│   └── checkpoints/
-│       └── kan_k5_seed42_best.pth
-└── README.md                      # This file
-```
-
----
-
+    |_ Python script
+    |_ README.md
 ## 12. Limitations and Future Directions
 
 ### Limitations
@@ -574,7 +521,7 @@ breastmnist_experiment/
 
 ---
 
-## 13. Detailed Results Tables
+## 13. Results Tables
 
 ### Results by K (Means ± Std over 3 seeds)
 
@@ -597,37 +544,14 @@ breastmnist_experiment/
 
 ---
 
-## 14. Narrative for Your Report
-
-### Opening
-
-> "We conduct a systematic comparison of Kolmogorov-Arnold Network (KAN) heads versus standard MLP heads on BreastMNIST, a benchmark medical image classification task. Using a controlled experimental design where a fixed MedViT backbone is paired with either a KAN-based or MLP-based FFN head, we demonstrate that KANs achieve competitive or superior performance with equal or fewer trainable parameters."
-
-### Methods
-
-> "We sweep over KAN basis function counts K ∈ {3, 5, 7, 9} and match ANN hidden widths to ensure parameter budgets are equal or favorable to ANN. All models are trained with AdamW + cosine annealing + early stopping on validation AUC. We repeat the sweep across three random seeds to assess robustness."
-
-### Results
-
-> "KAN heads achieve higher test AUC than matched-capacity ANN heads across all K values (mean improvement ~1-2% AUC). Importantly, KAN demonstrates superior sensitivity (recall of positives) at K=7, making it attractive for screening applications where missed positives are costly. Training curves reveal that KAN converges more smoothly with lower validation loss oscillations than ANN, suggesting better generalization."
-
-### Discussion
-
-> "These results suggest that KAN heads offer a compelling alternative to MLPs in medical imaging pipelines, particularly when parameter efficiency and high sensitivity are priorities. However, the dataset-specific nature of BreastMNIST (64×64, binary classification) necessitates validation on larger, more complex datasets. Future work should explore KAN integration into earlier network layers and the application of KAN-specific regularization techniques."
-
-### Conclusion
-
-> "We conclude that KANs are a viable, parameter-efficient alternative to standard MLP heads for medical image classification, with particular strength in high-recall screening scenarios. Further investigation on clinical datasets is warranted."
+## 14. Summary
+> We conduct a systematic comparison of Kolmogorov-Arnold Network (KAN) heads versus standard MLP heads on BreastMNIST, a benchmark medical image classification task. Using a controlled experimental design where a fixed MedViT backbone is paired with either a KAN-based or MLP-based FFN head, we demonstrate that KANs achieve competitive or superior performance with equal or fewer trainable parameters
+> We sweep over KAN basis function counts K ∈ {3, 5, 7, 9} and match ANN hidden widths to ensure parameter budgets are equal or favorable to ANN. All models are trained with AdamW + cosine annealing + early stopping on validation AUC. We repeat the sweep across three random seeds to assess robustness
+> KAN heads achieve higher test AUC than matched-capacity ANN heads across all K values (mean improvement ~1-2% AUC). Importantly, KAN demonstrates superior sensitivity (recall of positives) at K=7, making it attractive for screening applications where missed positives are costly. Training curves reveal that KAN converges more smoothly with lower validation loss oscillations than ANN, suggesting better generalization
+> These results suggest that KAN heads offer a compelling alternative to MLPs in medical imaging pipelines, particularly when parameter efficiency and high sensitivity are priorities. However, the dataset-specific nature of BreastMNIST (64×64, binary classification) necessitates validation on larger, more complex datasets. Future work should explore KAN integration into earlier network layers and the application of KAN-specific regularization techniques
+> We conclude that KANs are a viable, parameter-efficient alternative to standard MLP heads for medical image classification, with particular strength in high-recall screening scenarios. Further investigation on clinical datasets is warranted
 
 ---
-
-## 15. Summary for the Reviewer
-
-**Fair experimental design**: Matched parameter budgets, controlled variables  
-**Robust findings**: Repeated across 3 seeds, multiple K values  
-**Practical relevance**: Parameter efficiency + sensitivity important for clinical deployment  
-**Honest limitations**: Acknowledge dataset simplicity, need for larger-scale validation  
-**Clear narrative**: Each finding supported by curves, tables, and metrics  
 
 This work provides a **solid empirical foundation** for the claim that **KANs are competitive with MLPs** in medical imaging, with clear advantages in specific scenarios (high sensitivity, parameter constraints).
 
